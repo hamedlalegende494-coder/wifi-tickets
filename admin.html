@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Espace propriétaire</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main id="app">
+  <h1>Espace propriétaire</h1>
+  <form id="login" class="card">
+    <label for="email">Email</label><input id="email" type="email" required autocomplete="username">
+    <label for="pw">Mot de passe</label><input id="pw" type="password" required autocomplete="current-password">
+    <p id="lerr" class="err"></p>
+    <button class="main" id="signin">Se connecter</button>
+    <button class="ghost" id="signup" type="button" style="width:100%;margin-top:8px">Créer mon compte propriétaire</button>
+  </form>
+  <form id="setup" class="card hidden">
+    <h2 id="stitle" style="margin-top:0">Ma wifi zone</h2>
+    <div id="slugbox"><label for="slug">Identifiant de la zone (lettres minuscules, chiffres, tirets)</label><input id="slug" pattern="[a-z0-9\-]{3,30}" placeholder="ex: cafe-medina"></div>
+    <label for="nom">Nom affiché aux clients</label><input id="nom" required>
+    <label for="orange">Numéro Orange Money</label><input id="orange" type="tel">
+    <label for="wave">Numéro Wave</label><input id="wave" type="tel">
+    <label for="devise">Devise</label><input id="devise" value="FCFA">
+    <label for="offres">Offres (une par ligne : durée;prix)</label><textarea id="offres" rows="4" required placeholder="1 heure;200&#10;1 jour;500"></textarea>
+    <label for="loginurl">Adresse de connexion du routeur</label><input id="loginurl" value="http://192.168.88.1/login">
+    <p id="serr" class="err"></p>
+    <button class="main">Enregistrer</button>
+  </form>
+  <div id="dash" class="hidden">
+    <div class="card small"><b>Lien à utiliser dans le routeur :</b><p id="link" style="word-break:break-all;margin:6px 0 0"></p></div>
+    <details class="card"><summary>Modifier ma zone</summary><button class="ghost" id="edit" style="margin-top:8px">Ouvrir les paramètres</button></details>
+    <div class="row"><h2 id="count" style="margin:8px 0">Demandes en attente</h2><button class="ghost" id="out">Déconnexion</button></div>
+    <div id="list"></div>
+    <h2>Stock de codes</h2>
+    <div class="card"><div id="stock"></div>
+      <label for="of">Ajouter des codes pour l'offre</label>
+      <select id="of"></select>
+      <label for="codes">Codes (un par ligne)</label>
+      <textarea id="codes" rows="5"></textarea>
+      <button class="main" id="add">Importer les codes</button>
+    </div>
+  </div>
+</main>
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+import { getFirestore, collection, doc, query, where, limit, onSnapshot, getDocs, setDoc, runTransaction, updateDoc, writeBatch } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+import { firebaseConfig } from "./firebase-config.js";
+
+const app = initializeApp(firebaseConfig), auth = getAuth(app), db = getFirestore(app);
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+let unsubs = [], premier = true, CONFIG = null, zid = null, uid = null;
+const slugify = t => t.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+
+const auth_ = (fn, msg) => async () => {
+  if (!$("login").reportValidity()) return;
+  try { await fn(auth, $("email").value, $("pw").value); } catch { $("lerr").textContent = msg; }
+};
+$("signin").onclick = auth_(signInWithEmailAndPassword, "Email ou mot de passe incorrect.");
+$("signup").onclick = auth_(createUserWithEmailAndPassword, "Création impossible : email déjà utilisé ou mot de passe trop court (6 caractères minimum).");
+$("login").onsubmit = e => e.preventDefault();
+$("out").onclick = () => signOut(auth);
+
+onAuthStateChanged(auth, async u => {
+  const ok = u && !u.isAnonymous;
+  unsubs.forEach(f => f()); unsubs = []; premier = true; CONFIG = zid = null;
+  $("login").classList.toggle("hidden", !!ok);
+  $("dash").classList.add("hidden"); $("setup").classList.add("hidden");
+  if (!ok) return;
+  uid = u.uid;
+  const q = await getDocs(query(collection(db, "zones"), where("owner", "==", uid)));
+  if (q.empty) return afficherSetup(false);
+  zid = q.docs[0].id; CONFIG = q.docs[0].data();
+  tableau();
+});
+
+function afficherSetup(edition) {
+  $("dash").classList.add("hidden"); $("setup").classList.remove("hidden");
+  $("slugbox").classList.toggle("hidden", edition);
+  $("slug").required = !edition;
+  $("stitle").textContent = edition ? "Modifier ma zone" : "Créez votre wifi zone";
+  if (edition) {
+    $("nom").value = CONFIG.nom; $("orange").value = CONFIG.numeros.orange; $("wave").value = CONFIG.numeros.wave;
+    $("devise").value = CONFIG.devise; $("loginurl").value = CONFIG.loginUrl;
+    $("offres").value = CONFIG.offres.map(o => `${o.label};${o.prix}`).join("\n");
+  }
+}
+$("edit").onclick = () => afficherSetup(true);
+$("setup").onsubmit = async e => {
+  e.preventDefault();
+  const offres = $("offres").value.split("\n").map(l => l.split(";")).filter(p => p[0].trim() && Number(p[1]) > 0)
+    .map(p => ({ id: slugify(p[0]), label: p[0].trim(), prix: Number(p[1]) }));
+  if (!offres.length) return ($("serr").textContent = "Écrivez au moins une offre au format : 1 heure;200");
+  const data = { nom: $("nom").value.trim(), devise: $("devise").value.trim() || "FCFA", numeros: { orange: $("orange").value.trim(), wave: $("wave").value.trim() }, offres, loginUrl: $("loginurl").value.trim() };
+  try {
+    if (CONFIG) await updateDoc(doc(db, "zones", zid), data);
+    else { zid = $("slug").value; await setDoc(doc(db, "zones", zid), { owner: uid, ...data }); }
+    CONFIG = { owner: uid, ...data };
+    $("serr").textContent = ""; $("setup").classList.add("hidden"); tableau();
+  } catch { $("serr").textContent = "Enregistrement impossible : cet identifiant est peut-être déjà pris."; }
+};
+
+function tableau() {
+  $("dash").classList.remove("hidden");
+  $("link").textContent = new URL(`index.html?zone=${zid}`, location.href).href + "&login=$(link-login-only-esc)";
+  $("of").innerHTML = CONFIG.offres.map(o => `<option value="${o.id}">${esc(o.label)}</option>`).join("");
+  demarrer();
+}
+
+function bip() {
+  try { const c = new AudioContext(), o = c.createOscillator(); o.connect(c.destination); o.frequency.value = 880; o.start(); o.stop(c.currentTime + .25); } catch {}
+}
+
+function demarrer() {
+  unsubs.push(onSnapshot(query(collection(db, "zones", zid, "demandes"), where("statut", "==", "en_attente")), snap => {
+    if (!premier && snap.docChanges().some(c => c.type === "added")) bip();
+    premier = false;
+    const ds = snap.docs.map(d => ({ id: d.id, ...d.data() })).sort((a, b) => (a.creeLe?.seconds || 0) - (b.creeLe?.seconds || 0));
+    $("count").textContent = `Demandes en attente (${ds.length})`;
+    document.title = ds.length ? `(${ds.length}) Espace propriétaire` : "Espace propriétaire";
+    $("list").innerHTML = ds.length ? ds.map(d => {
+      const o = CONFIG.offres.find(x => x.id === d.offre) || { label: d.offre, prix: "?" };
+      return `<div class="card"><b>${esc(o.label)} · ${o.prix} ${esc(CONFIG.devise)}</b>
+        <p class="small">${d.operateur === "orange" ? "Orange Money" : "Wave"} · réf. <b>${esc(d.ref)}</b><br>Tél. ${esc(d.tel)}</p>
+        <div class="row"><button class="main" style="margin:0;flex:1" data-ok="${esc(d.id)}">Confirmer</button><button class="ghost" data-no="${esc(d.id)}">Refuser</button></div></div>`;
+    }).join("") : `<p>Aucune demande pour le moment.</p>`;
+    $("list").querySelectorAll("[data-ok]").forEach(b => b.onclick = () => confirmer(ds.find(d => d.id === b.dataset.ok), b));
+    $("list").querySelectorAll("[data-no]").forEach(b => b.onclick = () => updateDoc(doc(db, "zones", zid, "demandes", b.dataset.no), { statut: "refusé" }));
+  }));
+  unsubs.push(onSnapshot(query(collection(db, "zones", zid, "tickets"), where("utilise", "==", false)), snap => {
+    const n = {}; snap.forEach(d => n[d.data().offre] = (n[d.data().offre] || 0) + 1);
+    $("stock").innerHTML = CONFIG.offres.map(o => `<p>${esc(o.label)} : <b>${n[o.id] || 0}</b> code(s) disponible(s)</p>`).join("");
+  }));
+}
+
+async function confirmer(d, btn) {
+  btn.disabled = true;
+  try {
+    const q = await getDocs(query(collection(db, "zones", zid, "tickets"), where("offre", "==", d.offre), where("utilise", "==", false), limit(1)));
+    if (q.empty) { alert("Plus de codes disponibles pour cette offre. Importez-en d'abord."); btn.disabled = false; return; }
+    const tRef = q.docs[0].ref, dRef = doc(db, "zones", zid, "demandes", d.id);
+    await runTransaction(db, async tx => {
+      const t = await tx.get(tRef);
+      if (t.data().utilise) throw new Error("Code déjà pris, réessayez.");
+      tx.update(tRef, { utilise: true, demande: d.id });
+      tx.update(dRef, { statut: "confirmé", code: t.data().code });
+    });
+  } catch (e) { alert(e.message); btn.disabled = false; }
+}
+
+$("add").onclick = async () => {
+  const codes = [...new Set($("codes").value.split("\n").map(s => s.trim()).filter(Boolean))];
+  for (let i = 0; i < codes.length; i += 400) {
+    const b = writeBatch(db);
+    codes.slice(i, i + 400).forEach(c => b.set(doc(db, "zones", zid, "tickets", c.replace(/\//g, "_")), { code: c, offre: $("of").value, utilise: false }));
+    await b.commit();
+  }
+  $("codes").value = "";
+  alert(`${codes.length} code(s) importé(s).`);
+};
+</script>
+</body>
+</html>

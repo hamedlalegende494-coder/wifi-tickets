@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Acheter un ticket wifi</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main id="app"></main>
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+import { getFirestore, doc, getDoc, setDoc, onSnapshot, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+import { firebaseConfig } from "./firebase-config.js";
+
+const app = initializeApp(firebaseConfig), auth = getAuth(app), db = getFirestore(app);
+const $ = document.getElementById("app");
+const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const qs = new URLSearchParams(location.search), zid = qs.get("zone");
+let CONFIG = null;
+let offre = null, op = null, unsub = null;
+
+const user = (await signInAnonymously(auth)).user;
+try { const z = zid && await getDoc(doc(db, "zones", zid)); if (z && z.exists()) CONFIG = z.data(); } catch {}
+if (!CONFIG) { $.innerHTML = "<h1>Zone introuvable</h1><p>Ce lien n'est pas valide. Reconnectez-vous au wifi pour être redirigé.</p>"; throw new Error("zone"); }
+const loginBase = qs.get("login") || CONFIG.loginUrl || "http://192.168.88.1/login";
+const KEY = "demande_" + zid;
+
+function formulaire(erreur = "") {
+  $.innerHTML = `
+    <h1>${esc(CONFIG.nom)}</h1>
+    <p>Choisissez votre ticket, payez, puis envoyez votre demande.</p>
+    <h2>Durée</h2>
+    <div class="offres">${CONFIG.offres.map(o => `
+      <button class="offre" data-offre="${o.id}" aria-pressed="${offre === o.id}"><span>${esc(o.label)}</span><b>${o.prix} ${esc(CONFIG.devise)}</b></button>`).join("")}</div>
+    <h2>Payer avec</h2>
+    <div class="ops">
+      <button class="op orange" data-op="orange" aria-pressed="${op === "orange"}">Orange Money</button>
+      <button class="op wave" data-op="wave" aria-pressed="${op === "wave"}">Wave</button>
+    </div>
+    <div id="pay"></div>
+    <form id="f" class="card hidden">
+      <label for="tel">Votre numéro de téléphone</label>
+      <input id="tel" type="tel" inputmode="tel" required minlength="8" autocomplete="tel">
+      <label for="ref">Référence de la transaction</label>
+      <input id="ref" required minlength="5" maxlength="40" autocapitalize="characters" placeholder="Reçue par SMS après le paiement">
+      <p id="msg" class="err"></p>
+      <button class="main" id="go">J'ai payé, envoyer ma demande</button>
+    </form>`;
+  if (erreur) document.getElementById("msg").textContent = erreur;
+  $.querySelectorAll("[data-offre]").forEach(b => b.onclick = () => { offre = b.dataset.offre; formulaire(); });
+  $.querySelectorAll("[data-op]").forEach(b => b.onclick = () => { op = b.dataset.op; formulaire(); });
+  if (offre && op) {
+    const o = CONFIG.offres.find(x => x.id === offre);
+    document.getElementById("pay").innerHTML = `<div class="card"><p>1. Envoyez <b>${o.prix} ${esc(CONFIG.devise)}</b> par ${op === "orange" ? "Orange Money" : "Wave"} au :</p><div class="num">${esc(CONFIG.numeros[op])}</div><p class="small">2. Notez la référence reçue par SMS, puis remplissez le formulaire ci-dessous.</p></div>`;
+    const f = document.getElementById("f");
+    f.classList.remove("hidden");
+    f.onsubmit = envoyer;
+  }
+}
+
+async function envoyer(e) {
+  e.preventDefault();
+  const ref = document.getElementById("ref").value.toUpperCase().replace(/[^A-Z0-9]/g, "");
+  const tel = document.getElementById("tel").value.trim();
+  if (ref.length < 5) return (document.getElementById("msg").textContent = "Référence invalide.");
+  const id = op + "_" + ref;
+  document.getElementById("go").disabled = true;
+  try {
+    // l'identifiant = opérateur + référence : une même référence ne peut servir qu'une fois
+    await setDoc(doc(db, "zones", zid, "demandes", id), { uid: user.uid, offre, operateur: op, ref, tel, statut: "en_attente", creeLe: serverTimestamp() });
+    localStorage.setItem(KEY, id);
+    suivre(id);
+  } catch (err) {
+    formulaire("Cette référence a déjà été utilisée ou la demande est refusée. Vérifiez-la.");
+  }
+}
+
+function suivre(id) {
+  if (unsub) unsub();
+  unsub = onSnapshot(doc(db, "zones", zid, "demandes", id), snap => {
+    if (!snap.exists()) return reset();
+    const d = snap.data();
+    if (d.statut === "en_attente") {
+      $.innerHTML = `<h1>Demande envoyée</h1><div class="card"><p><span class="pulse"></span>En attente de confirmation du propriétaire.</p><p class="small">Gardez cette page ouverte : votre code s'affichera ici automatiquement.</p></div>`;
+    } else if (d.statut === "confirmé") {
+      $.innerHTML = `<h1>Paiement confirmé</h1><p>Voici votre code wifi :</p><div class="code" id="code">${esc(d.code)}</div>
+        <div class="row"><button class="ghost" id="copy">Copier le code</button></div>
+        <button class="main" id="login">Me connecter au wifi</button>`;
+      document.getElementById("copy").onclick = () => navigator.clipboard?.writeText(d.code);
+      document.getElementById("login").onclick = () => { location.href = `${loginBase}?username=${encodeURIComponent(d.code)}&password=${encodeURIComponent(d.code)}`; };
+    } else {
+      $.innerHTML = `<h1>Demande refusée</h1><div class="card"><p class="err">Le propriétaire n'a pas retrouvé votre paiement.</p><p class="small">Vérifiez la référence et le montant, puis refaites une demande.</p></div><button class="main" id="again">Refaire une demande</button>`;
+      document.getElementById("again").onclick = reset;
+    }
+  }, reset);
+}
+function reset() { localStorage.removeItem(KEY); if (unsub) unsub(); offre = op = null; formulaire(); }
+
+const saved = localStorage.getItem(KEY);
+saved ? suivre(saved) : formulaire();
+</script>
+</body>
+</html>
